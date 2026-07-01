@@ -154,7 +154,7 @@ async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
       input: {
         name: "available",
         reason: "correction",
-        changes: [{ inventoryItemId, locationId, delta }]
+        changes: [{ inventoryItemId, locationId, delta, changeFromQuantity }]
       }
     }
   );
@@ -456,7 +456,7 @@ async function applyDiff(diff) {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.10.0" });
+const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.11.0" });
 
 server.tool(
   "list_products",
@@ -875,7 +875,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.10.0", mcpEndpoint: "/mcp" });
+  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.11.0", mcpEndpoint: "/mcp" });
 });
 
 app.post("/mcp", assertAuthorized, async (req, res) => {
@@ -892,5 +892,5 @@ app.post("/mcp", assertAuthorized, async (req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`VitaFlow Shopify MCP v2.10.0 listening on port ${PORT}`);
+  console.log(`VitaFlow Shopify MCP v2.11.0 listening on port ${PORT}`);
 });
