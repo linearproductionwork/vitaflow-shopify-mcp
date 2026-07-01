@@ -12,6 +12,7 @@ const {
   SHOPIFY_CLIENT_ID,
   SHOPIFY_CLIENT_SECRET,
   SHOPIFY_API_VERSION = "2026-04",
+  SHOPIFY_LOCATION_ID,
   MCP_AUTH_TOKEN,
   PORT = 3000
 } = process.env;
@@ -65,7 +66,7 @@ async function shopifyGraphql(query, variables = {}) {
 
 // ── Shopify helpers ───────────────────────────────────────────────────────────
 
-let cachedLocationId = null;
+let cachedLocationId = SHOPIFY_LOCATION_ID || null;
 
 async function getPrimaryLocationId() {
   if (cachedLocationId) return cachedLocationId;
@@ -432,7 +433,7 @@ async function applyDiff(diff) {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.4.0" });
+const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.5.0" });
 
 server.tool(
   "list_products",
@@ -813,7 +814,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.4.0", mcpEndpoint: "/mcp" });
+  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.5.0", mcpEndpoint: "/mcp" });
 });
 
 app.post("/mcp", assertAuthorized, async (req, res) => {
@@ -830,5 +831,5 @@ app.post("/mcp", assertAuthorized, async (req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`VitaFlow Shopify MCP v2.4.0 listening on port ${PORT}`);
+  console.log(`VitaFlow Shopify MCP v2.5.0 listening on port ${PORT}`);
 });
