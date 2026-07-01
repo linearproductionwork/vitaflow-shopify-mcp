@@ -100,25 +100,29 @@ async function variantsBulkUpdate(productId, variants) {
   return data.productVariantsBulkUpdate;
 }
 
-// Activates inventory item at location if needed, then sets absolute quantity
+// Reads current stock + activates at location if needed, then sets absolute quantity.
+// changeFromQuantity is required by Shopify API 2026-04.
 async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
-  // Check if already activated at this location
   const check = await shopifyGraphql(
     `query CheckInventoryLevel($id: ID!) {
       inventoryItem(id: $id) {
         inventoryLevels(first: 50) {
-          nodes { location { id } }
+          nodes {
+            location { id }
+            quantities(names: ["available"]) { name quantity }
+          }
         }
       }
     }`,
     { id: inventoryItemId }
   );
 
-  const activated = check.inventoryItem.inventoryLevels.nodes.some(
-    l => l.location.id === locationId
-  );
+  const levels = check.inventoryItem.inventoryLevels.nodes;
+  const level  = levels.find(l => l.location.id === locationId);
 
-  if (!activated) {
+  let changeFromQuantity = 0;
+
+  if (!level) {
     const activateData = await shopifyGraphql(
       `mutation ActivateInventory($itemId: ID!, $updates: [InventoryBulkToggleActivationInput!]!) {
         inventoryBulkToggleActivation(inventoryItemId: $itemId, inventoryItemUpdates: $updates) {
@@ -132,6 +136,9 @@ async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
     if (activateErrors.length) {
       throw new Error(`Inventory activation failed: ${JSON.stringify(activateErrors)}`);
     }
+  } else {
+    const avail = level.quantities.find(q => q.name === "available");
+    changeFromQuantity = avail ? avail.quantity : 0;
   }
 
   const data = await shopifyGraphql(
@@ -145,7 +152,7 @@ async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
       input: {
         name: "available",
         reason: "correction",
-        quantities: [{ inventoryItemId, locationId, quantity }]
+        quantities: [{ inventoryItemId, locationId, quantity, changeFromQuantity }]
       }
     }
   );
@@ -153,7 +160,7 @@ async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
   const errs = data.inventorySetQuantities.userErrors;
   if (errs.length) throw new Error(`inventorySetQuantities failed: ${JSON.stringify(errs)}`);
 
-  return data.inventorySetQuantities;
+  return { ...data.inventorySetQuantities, previousQuantity: changeFromQuantity, newQuantity: quantity };
 }
 
 async function getAllShopifyProducts() {
@@ -209,6 +216,21 @@ function normalizeStatus(raw) {
 
 function str(v) { return String(v || "").trim(); }
 
+// 180.00 and 180 are the same price — compare as floats
+function pricesEqual(a, b) {
+  const fa = parseFloat(a);
+  const fb = parseFloat(b);
+  if (isNaN(fa) || isNaN(fb)) return a === b;
+  return Math.abs(fa - fb) < 0.001;
+}
+
+// null = not present in CSV, do not change
+function parseTaxable(raw) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (s === "") return null;
+  return s !== "false" && s !== "0";
+}
+
 function groupRowsByHandle(rows) {
   const products = new Map();
 
@@ -236,13 +258,12 @@ function groupRowsByHandle(rows) {
     const price = str(row["Variant Price"]);
     const sku = str(row["Variant SKU"]);
     if (price || sku) {
-      const taxableRaw = str(row["Variant Taxable"]).toLowerCase();
       const inventoryQty = str(row["Variant Inventory Qty"]);
       products.get(handle).variants.push({
         sku,
         price,
         compareAtPrice: str(row["Variant Compare At Price"]) || null,
-        taxable: taxableRaw !== "false",
+        taxable: parseTaxable(row["Variant Taxable"]),  // null = not in CSV, do not touch
         inventoryQty: inventoryQty !== "" ? Number(inventoryQty) : null,
         option1: str(row["Option1 Value"]),
         option2: str(row["Option2 Value"]),
@@ -297,11 +318,12 @@ function buildDiff(fileProducts, shopifyProducts) {
         : sp.variants.nodes[0];
       if (!sv) continue;
 
-      if (fv.price && fv.price !== sv.price)
+      if (fv.price && !pricesEqual(fv.price, sv.price))
         variantChanges.push({ variantId: sv.id, sku: fv.sku, field: "price", from: sv.price, to: fv.price });
-      if (fv.compareAtPrice !== null && fv.compareAtPrice !== (sv.compareAtPrice || ""))
+      if (fv.compareAtPrice !== null && !pricesEqual(fv.compareAtPrice, sv.compareAtPrice || ""))
         variantChanges.push({ variantId: sv.id, sku: fv.sku, field: "compareAtPrice", from: sv.compareAtPrice, to: fv.compareAtPrice });
-      if (fv.taxable !== sv.taxable)
+      // taxable: null means column was absent from CSV — do not change
+      if (fv.taxable !== null && fv.taxable !== sv.taxable)
         variantChanges.push({ variantId: sv.id, sku: fv.sku, field: "taxable", from: sv.taxable, to: fv.taxable });
       if (fv.inventoryQty !== null && fv.inventoryQty !== sv.inventoryQuantity && sv.inventoryItem?.id)
         inventoryChanges.push({ inventoryItemId: sv.inventoryItem.id, variantId: sv.id, sku: fv.sku, from: sv.inventoryQuantity, to: fv.inventoryQty });
@@ -432,7 +454,7 @@ async function applyDiff(diff) {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.7.0" });
+const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.8.0" });
 
 server.tool(
   "list_products",
@@ -696,14 +718,44 @@ server.tool(
 
 server.tool(
   "set_inventory",
-  "Set available stock quantity for a variant at a location. Activates the inventory item at the location automatically if needed. Use get_locations to find locationId, and list_products to find inventoryItem.id. Use only after store owner confirms.",
+  "Set stock for a single variant. Reads the current quantity automatically and sends changeFromQuantity as required by Shopify 2026-04. Activates at location if needed. Use only after store owner confirms.",
   {
-    inventoryItemId: z.string().describe("gid://shopify/InventoryItem/... — get it from list_products or get_product_by_handle"),
-    locationId: z.string().describe("gid://shopify/Location/... — get it from get_locations"),
+    inventoryItemId: z.string().describe("gid://shopify/InventoryItem/... — get from list_products"),
+    locationId: z.string().describe("gid://shopify/Location/... — get from get_locations"),
     quantity: z.number().int().min(0)
   },
   async ({ inventoryItemId, locationId, quantity }) => {
     const result = await activateAndSetInventory(inventoryItemId, locationId, quantity);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "bulk_set_inventory",
+  "Set stock for multiple variants at once. Only touches inventory — does not change price, taxable, status, or any other field. Reads current quantity per variant automatically. Use only after store owner confirms.",
+  {
+    locationId: z.string().describe("gid://shopify/Location/... — get from get_locations"),
+    updates: z.array(z.object({
+      inventoryItemId: z.string().describe("gid://shopify/InventoryItem/..."),
+      quantity: z.number().int().min(0),
+      label: z.string().optional().describe("Product/variant name for logging")
+    }))
+  },
+  async ({ locationId, updates }) => {
+    const log = [];
+    for (const u of updates) {
+      try {
+        const result = await activateAndSetInventory(u.inventoryItemId, locationId, u.quantity);
+        log.push({ inventoryItemId: u.inventoryItemId, label: u.label ?? u.inventoryItemId, status: "success", previousQuantity: result.previousQuantity, newQuantity: result.newQuantity });
+      } catch (e) {
+        log.push({ inventoryItemId: u.inventoryItemId, label: u.label ?? u.inventoryItemId, status: "error", error: e.message });
+      }
+    }
+    const result = {
+      applied: log.filter(l => l.status === "success").length,
+      errors: log.filter(l => l.status === "error").length,
+      log
+    };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -821,7 +873,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.7.0", mcpEndpoint: "/mcp" });
+  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.8.0", mcpEndpoint: "/mcp" });
 });
 
 app.post("/mcp", assertAuthorized, async (req, res) => {
@@ -838,5 +890,5 @@ app.post("/mcp", assertAuthorized, async (req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`VitaFlow Shopify MCP v2.7.0 listening on port ${PORT}`);
+  console.log(`VitaFlow Shopify MCP v2.8.0 listening on port ${PORT}`);
 });
