@@ -433,7 +433,7 @@ async function applyDiff(diff) {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.5.0" });
+const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.6.0" });
 
 server.tool(
   "list_products",
@@ -485,9 +485,17 @@ server.tool(
 
 server.tool(
   "get_locations",
-  "List Shopify fulfillment locations. Required to know the locationId before setting inventory.",
+  "List Shopify fulfillment locations. Returns the configured primary location if SHOPIFY_LOCATION_ID is set, otherwise queries Shopify.",
   {},
   async () => {
+    if (SHOPIFY_LOCATION_ID) {
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify([{ id: SHOPIFY_LOCATION_ID, name: "Primary location (from config)", isPrimary: true }], null, 2)
+        }]
+      };
+    }
     const data = await shopifyGraphql(
       `query { locations(first: 20, includeInactive: false) { nodes { id name address { city } isPrimary } } }`
     );
@@ -814,7 +822,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.5.0", mcpEndpoint: "/mcp" });
+  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.6.0", mcpEndpoint: "/mcp" });
 });
 
 app.post("/mcp", assertAuthorized, async (req, res) => {
@@ -831,5 +839,5 @@ app.post("/mcp", assertAuthorized, async (req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`VitaFlow Shopify MCP v2.5.0 listening on port ${PORT}`);
+  console.log(`VitaFlow Shopify MCP v2.6.0 listening on port ${PORT}`);
 });
