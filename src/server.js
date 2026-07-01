@@ -141,9 +141,11 @@ async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
     changeFromQuantity = avail ? avail.quantity : 0;
   }
 
+  const delta = quantity - changeFromQuantity;
+
   const data = await shopifyGraphql(
-    `mutation SetInventory($input: InventorySetQuantitiesInput!) {
-      inventorySetQuantities(input: $input) {
+    `mutation AdjustInventory($input: InventoryAdjustQuantitiesInput!) {
+      inventoryAdjustQuantities(input: $input) {
         inventoryAdjustmentGroup { id reason }
         userErrors { field message }
       }
@@ -152,16 +154,15 @@ async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
       input: {
         name: "available",
         reason: "correction",
-        referenceDocumentUri: `https://${SHOPIFY_SHOP}/mcp/inventory/${inventoryItemId.split("/").pop()}/${Date.now()}`,
-        quantities: [{ inventoryItemId, locationId, quantity, changeFromQuantity }]
+        changes: [{ inventoryItemId, locationId, delta }]
       }
     }
   );
 
-  const errs = data.inventorySetQuantities.userErrors;
-  if (errs.length) throw new Error(`inventorySetQuantities failed: ${JSON.stringify(errs)}`);
+  const errs = data.inventoryAdjustQuantities.userErrors;
+  if (errs.length) throw new Error(`inventoryAdjustQuantities failed: ${JSON.stringify(errs)}`);
 
-  return { ...data.inventorySetQuantities, previousQuantity: changeFromQuantity, newQuantity: quantity };
+  return { ...data.inventoryAdjustQuantities, previousQuantity: changeFromQuantity, newQuantity: quantity, delta };
 }
 
 async function getAllShopifyProducts() {
@@ -455,7 +456,7 @@ async function applyDiff(diff) {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.9.0" });
+const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.10.0" });
 
 server.tool(
   "list_products",
@@ -874,7 +875,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.9.0", mcpEndpoint: "/mcp" });
+  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.10.0", mcpEndpoint: "/mcp" });
 });
 
 app.post("/mcp", assertAuthorized, async (req, res) => {
@@ -891,5 +892,5 @@ app.post("/mcp", assertAuthorized, async (req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`VitaFlow Shopify MCP v2.9.0 listening on port ${PORT}`);
+  console.log(`VitaFlow Shopify MCP v2.10.0 listening on port ${PORT}`);
 });
