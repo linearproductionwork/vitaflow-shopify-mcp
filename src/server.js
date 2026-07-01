@@ -118,7 +118,7 @@ async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
   );
 
   if (!activated) {
-    await shopifyGraphql(
+    const activateData = await shopifyGraphql(
       `mutation ActivateInventory($itemId: ID!, $updates: [InventoryBulkToggleActivationInput!]!) {
         inventoryBulkToggleActivation(inventoryItemId: $itemId, inventoryItemUpdates: $updates) {
           inventoryItem { id }
@@ -127,6 +127,10 @@ async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
       }`,
       { itemId: inventoryItemId, updates: [{ locationId, activate: true }] }
     );
+    const activateErrors = activateData.inventoryBulkToggleActivation.userErrors;
+    if (activateErrors.length) {
+      throw new Error(`Inventory activation failed: ${JSON.stringify(activateErrors)}`);
+    }
   }
 
   const data = await shopifyGraphql(
@@ -140,10 +144,14 @@ async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
       input: {
         name: "available",
         reason: "correction",
+        ignoreCompareQuantity: true,
         quantities: [{ inventoryItemId, locationId, quantity }]
       }
     }
   );
+
+  const errs = data.inventorySetQuantities.userErrors;
+  if (errs.length) throw new Error(`inventorySetQuantities failed: ${JSON.stringify(errs)}`);
 
   return data.inventorySetQuantities;
 }
@@ -424,7 +432,7 @@ async function applyDiff(diff) {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.3.0" });
+const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.4.0" });
 
 server.tool(
   "list_products",
@@ -805,7 +813,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.3.0", mcpEndpoint: "/mcp" });
+  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.4.0", mcpEndpoint: "/mcp" });
 });
 
 app.post("/mcp", assertAuthorized, async (req, res) => {
@@ -822,5 +830,5 @@ app.post("/mcp", assertAuthorized, async (req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`VitaFlow Shopify MCP v2.3.0 listening on port ${PORT}`);
+  console.log(`VitaFlow Shopify MCP v2.4.0 listening on port ${PORT}`);
 });
