@@ -323,7 +323,7 @@ async function applyDiff(diff) {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.0.0" });
+const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.1.0" });
 
 // Existing tools
 
@@ -445,33 +445,60 @@ server.tool(
 // New tools
 
 server.tool(
+  "get_product_by_handle",
+  "Fetch a single Shopify product by its handle or search by title. Use before create_product to avoid duplicates.",
+  {
+    handle: z.string().optional().describe("Product handle, e.g. 'protein-isolate'"),
+    title: z.string().optional().describe("Product title to search for (partial match)")
+  },
+  async ({ handle, title }) => {
+    if (!handle && !title) throw new Error("Provide at least handle or title.");
+
+    const query = handle
+      ? `query { products(first: 5, query: "handle:${handle}") { nodes { id title handle status vendor productType tags variants(first: 10) { nodes { id sku price compareAtPrice taxable } } } } }`
+      : `query { products(first: 10, query: "title:${title}") { nodes { id title handle status vendor productType tags variants(first: 10) { nodes { id sku price compareAtPrice taxable } } } } }`;
+
+    const data = await shopifyGraphql(query);
+    return { content: [{ type: "text", text: JSON.stringify(data.products.nodes, null, 2) }] };
+  }
+);
+
+server.tool(
   "create_product",
-  "Create a new Shopify product. Use only after the store owner confirms.",
+  "Create a new Shopify product. Use get_product_by_handle first to confirm it doesn't already exist. Use only after the store owner confirms.",
   {
     title: z.string().min(1),
-    bodyHtml: z.string().optional(),
+    handle: z.string().optional().describe("URL-friendly handle, e.g. 'protein-isolate'. Shopify auto-generates if omitted."),
+    bodyHtml: z.string().optional().describe("Product description in HTML"),
     vendor: z.string().optional(),
     productType: z.string().optional(),
     tags: z.array(z.string()).optional(),
     status: z.enum(["ACTIVE", "DRAFT"]).default("DRAFT"),
+    categoryId: z.string().optional().describe("Shopify taxonomy category ID, e.g. gid://shopify/TaxonomyCategory/..."),
+    imageSrc: z.string().optional().describe("URL of the product image"),
     variants: z.array(z.object({
       price: z.string(),
       sku: z.string().optional(),
       taxable: z.boolean().default(true),
+      requiresShipping: z.boolean().default(true),
       compareAtPrice: z.string().optional()
     })).optional()
   },
-  async ({ title, bodyHtml, vendor, productType, tags, status, variants }) => {
+  async ({ title, handle, bodyHtml, vendor, productType, tags, status, categoryId, imageSrc, variants }) => {
     const input = {
       title, status,
+      ...(handle && { handle }),
       ...(bodyHtml && { bodyHtml }),
       ...(vendor && { vendor }),
       ...(productType && { productType }),
       ...(tags?.length && { tags }),
+      ...(categoryId && { category: categoryId }),
+      ...(imageSrc && { images: [{ src: imageSrc }] }),
       ...(variants?.length && {
         variants: variants.map(v => ({
           price: v.price,
           taxable: v.taxable,
+          requiresShipping: v.requiresShipping,
           ...(v.sku && { sku: v.sku }),
           ...(v.compareAtPrice && { compareAtPrice: v.compareAtPrice })
         }))
@@ -481,7 +508,7 @@ server.tool(
     const data = await shopifyGraphql(
       `mutation ProductCreate($input: ProductInput!) {
         productCreate(input: $input) {
-          product { id title handle status }
+          product { id title handle status category { id name } }
           userErrors { field message }
         }
       }`,
@@ -688,5 +715,5 @@ app.post("/mcp", assertAuthorized, async (req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`VitaFlow Shopify MCP v2.0.0 listening on port ${PORT}`);
+  console.log(`VitaFlow Shopify MCP v2.1.0 listening on port ${PORT}`);
 });
