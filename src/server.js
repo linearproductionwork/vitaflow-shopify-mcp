@@ -54,10 +54,7 @@ async function shopifyGraphql(query, variables = {}) {
   const token = await getShopifyAccessToken();
   const response = await fetch(`https://${SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": token
-    },
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
     body: JSON.stringify({ query, variables })
   });
 
@@ -66,7 +63,41 @@ async function shopifyGraphql(query, variables = {}) {
   return data.data;
 }
 
-// ── Paginated product fetch ───────────────────────────────────────────────────
+// ── Shopify helpers ───────────────────────────────────────────────────────────
+
+let cachedLocationId = null;
+
+async function getPrimaryLocationId() {
+  if (cachedLocationId) return cachedLocationId;
+  const data = await shopifyGraphql(
+    `query { locations(first: 1, includeInactive: false) { nodes { id name } } }`
+  );
+  if (!data.locations.nodes.length) throw new Error("No active locations found in Shopify.");
+  cachedLocationId = data.locations.nodes[0].id;
+  return cachedLocationId;
+}
+
+async function getProductIdFromVariant(variantId) {
+  const data = await shopifyGraphql(
+    `query GetVariant($id: ID!) { productVariant(id: $id) { product { id } } }`,
+    { id: variantId }
+  );
+  return data.productVariant.product.id;
+}
+
+// Replaces deprecated productVariantUpdate
+async function variantsBulkUpdate(productId, variants) {
+  const data = await shopifyGraphql(
+    `mutation VariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+        productVariants { id price compareAtPrice taxable }
+        userErrors { field message }
+      }
+    }`,
+    { productId, variants }
+  );
+  return data.productVariantsBulkUpdate;
+}
 
 async function getAllShopifyProducts() {
   const all = [];
@@ -82,14 +113,17 @@ async function getAllShopifyProducts() {
             id title handle status vendor productType tags descriptionHtml
             category { id name fullName }
             variants(first: 100) {
-              nodes { id title sku price compareAtPrice taxable }
+              nodes {
+                id title sku price compareAtPrice taxable
+                inventoryItem { id }
+                inventoryQuantity
+              }
             }
           }
         }
       }`,
       { first: 100, after }
     );
-
     all.push(...data.products.nodes);
     hasNextPage = data.products.pageInfo.hasNextPage;
     after = data.products.pageInfo.endCursor;
@@ -104,7 +138,6 @@ function parseFileContent(content, fileType) {
   const workbook = fileType === "excel"
     ? XLSX.read(Buffer.from(content, "base64"), { type: "buffer" })
     : XLSX.read(content, { type: "string" });
-
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   return XLSX.utils.sheet_to_json(sheet, { defval: "" });
 }
@@ -147,11 +180,13 @@ function groupRowsByHandle(rows) {
     const sku = str(row["Variant SKU"]);
     if (price || sku) {
       const taxableRaw = str(row["Variant Taxable"]).toLowerCase();
+      const inventoryQty = str(row["Variant Inventory Qty"]);
       products.get(handle).variants.push({
         sku,
         price,
         compareAtPrice: str(row["Variant Compare At Price"]) || null,
         taxable: taxableRaw !== "false",
+        inventoryQty: inventoryQty !== "" ? Number(inventoryQty) : null,
         option1: str(row["Option1 Value"]),
         option2: str(row["Option2 Value"]),
         option3: str(row["Option3 Value"])
@@ -191,12 +226,14 @@ function buildDiff(fileProducts, shopifyProducts) {
     if (fp.status !== sp.status)
       changes.push({ field: "status", from: sp.status, to: fp.status });
 
-    const fileTags  = fp.tags.split(",").map(t => t.trim()).filter(Boolean).sort().join(",");
-    const shopTags  = [...sp.tags].sort().join(",");
+    const fileTags = fp.tags.split(",").map(t => t.trim()).filter(Boolean).sort().join(",");
+    const shopTags = [...sp.tags].sort().join(",");
     if (fileTags && fileTags !== shopTags)
       changes.push({ field: "tags", from: shopTags, to: fileTags });
 
     const variantChanges = [];
+    const inventoryChanges = [];
+
     for (const fv of fp.variants) {
       const sv = fv.sku
         ? sp.variants.nodes.find(v => v.sku === fv.sku)
@@ -209,10 +246,12 @@ function buildDiff(fileProducts, shopifyProducts) {
         variantChanges.push({ variantId: sv.id, sku: fv.sku, field: "compareAtPrice", from: sv.compareAtPrice, to: fv.compareAtPrice });
       if (fv.taxable !== sv.taxable)
         variantChanges.push({ variantId: sv.id, sku: fv.sku, field: "taxable", from: sv.taxable, to: fv.taxable });
+      if (fv.inventoryQty !== null && fv.inventoryQty !== sv.inventoryQuantity && sv.inventoryItem?.id)
+        inventoryChanges.push({ inventoryItemId: sv.inventoryItem.id, variantId: sv.id, sku: fv.sku, from: sv.inventoryQuantity, to: fv.inventoryQty });
     }
 
-    if (changes.length || variantChanges.length) {
-      toUpdate.push({ fileProduct: fp, shopifyProduct: sp, changes, variantChanges });
+    if (changes.length || variantChanges.length || inventoryChanges.length) {
+      toUpdate.push({ fileProduct: fp, shopifyProduct: sp, changes, variantChanges, inventoryChanges });
     } else {
       unchanged.push({ handle: sp.handle, title: sp.title });
     }
@@ -227,25 +266,24 @@ function buildDiff(fileProducts, shopifyProducts) {
 
 async function applyDiff(diff) {
   const log = [];
+  const locationId = await getPrimaryLocationId();
 
   for (const { fileProduct: fp } of diff.toCreate) {
     try {
       const input = {
-        title: fp.title,
+        title: fp.title, status: fp.status,
         ...(fp.bodyHtml && { bodyHtml: fp.bodyHtml }),
         ...(fp.vendor && { vendor: fp.vendor }),
         ...(fp.productType && { productType: fp.productType }),
         ...(fp.tags && { tags: fp.tags.split(",").map(t => t.trim()).filter(Boolean) }),
-        status: fp.status
+        ...(fp.variants.length && {
+          variants: fp.variants.map(v => ({
+            price: v.price, taxable: v.taxable,
+            ...(v.sku && { sku: v.sku }),
+            ...(v.compareAtPrice && { compareAtPrice: v.compareAtPrice })
+          }))
+        })
       };
-      if (fp.variants.length) {
-        input.variants = fp.variants.map(v => ({
-          price: v.price,
-          ...(v.sku && { sku: v.sku }),
-          taxable: v.taxable,
-          ...(v.compareAtPrice && { compareAtPrice: v.compareAtPrice })
-        }));
-      }
 
       const data = await shopifyGraphql(
         `mutation ProductCreate($input: ProductInput!) {
@@ -264,7 +302,7 @@ async function applyDiff(diff) {
     }
   }
 
-  for (const { shopifyProduct: sp, changes, variantChanges } of diff.toUpdate) {
+  for (const { shopifyProduct: sp, changes, variantChanges, inventoryChanges } of diff.toUpdate) {
     if (changes.length) {
       try {
         const input = { id: sp.id };
@@ -275,7 +313,6 @@ async function applyDiff(diff) {
           if (c.field === "status")      input.status = c.to;
           if (c.field === "tags")        input.tags = c.to.split(",").map(t => t.trim()).filter(Boolean);
         }
-
         const data = await shopifyGraphql(
           `mutation ProductUpdate($input: ProductInput!) {
             productUpdate(input: $input) {
@@ -285,7 +322,6 @@ async function applyDiff(diff) {
           }`,
           { input }
         );
-
         const errs = data.productUpdate.userErrors;
         log.push({ action: "update", id: sp.id, title: sp.title, status: errs.length ? "error" : "success", changes, ...(errs.length ? { errors: errs } : {}) });
       } catch (e) {
@@ -293,27 +329,56 @@ async function applyDiff(diff) {
       }
     }
 
-    for (const vc of variantChanges) {
+    if (variantChanges.length) {
       try {
-        const input = { id: vc.variantId };
-        if (vc.field === "price")          input.price = vc.to;
-        if (vc.field === "compareAtPrice") input.compareAtPrice = vc.to;
-        if (vc.field === "taxable")        input.taxable = vc.to;
+        const variantsByProduct = new Map();
+        for (const vc of variantChanges) {
+          if (!variantsByProduct.has(sp.id)) variantsByProduct.set(sp.id, []);
+          const entry = variantsByProduct.get(sp.id).find(v => v.id === vc.variantId);
+          if (entry) {
+            if (vc.field === "price") entry.price = vc.to;
+            if (vc.field === "compareAtPrice") entry.compareAtPrice = vc.to;
+            if (vc.field === "taxable") entry.taxable = vc.to;
+          } else {
+            variantsByProduct.get(sp.id).push({
+              id: vc.variantId,
+              ...(vc.field === "price" && { price: vc.to }),
+              ...(vc.field === "compareAtPrice" && { compareAtPrice: vc.to }),
+              ...(vc.field === "taxable" && { taxable: vc.to })
+            });
+          }
+        }
 
+        for (const [productId, variants] of variantsByProduct) {
+          const result = await variantsBulkUpdate(productId, variants);
+          const errs = result.userErrors;
+          log.push({ action: "updateVariants", productId, status: errs.length ? "error" : "success", count: variants.length, ...(errs.length ? { errors: errs } : {}) });
+        }
+      } catch (e) {
+        log.push({ action: "updateVariants", productId: sp.id, status: "error", error: e.message });
+      }
+    }
+
+    if (inventoryChanges.length) {
+      try {
+        const quantities = inventoryChanges.map(ic => ({
+          inventoryItemId: ic.inventoryItemId,
+          locationId,
+          quantity: ic.to
+        }));
         const data = await shopifyGraphql(
-          `mutation ProductVariantUpdate($input: ProductVariantInput!) {
-            productVariantUpdate(input: $input) {
-              productVariant { id price taxable compareAtPrice }
+          `mutation SetInventory($input: InventorySetQuantitiesInput!) {
+            inventorySetQuantities(input: $input) {
+              inventoryAdjustmentGroup { id }
               userErrors { field message }
             }
           }`,
-          { input }
+          { input: { name: "available", reason: "correction", quantities } }
         );
-
-        const errs = data.productVariantUpdate.userErrors;
-        log.push({ action: "updateVariant", variantId: vc.variantId, sku: vc.sku, field: vc.field, from: vc.from, to: vc.to, status: errs.length ? "error" : "success" });
+        const errs = data.inventorySetQuantities.userErrors;
+        log.push({ action: "setInventory", productTitle: sp.title, status: errs.length ? "error" : "success", changes: inventoryChanges.map(ic => ({ sku: ic.sku, from: ic.from, to: ic.to })), ...(errs.length ? { errors: errs } : {}) });
       } catch (e) {
-        log.push({ action: "updateVariant", variantId: vc.variantId, status: "error", error: e.message });
+        log.push({ action: "setInventory", productTitle: sp.title, status: "error", error: e.message });
       }
     }
   }
@@ -323,13 +388,11 @@ async function applyDiff(diff) {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.1.0" });
-
-// Existing tools
+const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.2.0" });
 
 server.tool(
   "list_products",
-  "List Shopify products with product type, tags, vendor, status, variants, and category.",
+  "List Shopify products with type, tags, vendor, status, variants, category, and inventory.",
   { first: z.number().min(1).max(100).default(50) },
   async ({ first }) => {
     const data = await shopifyGraphql(
@@ -338,7 +401,9 @@ server.tool(
           nodes {
             id title handle status vendor productType tags description
             category { id name fullName }
-            variants(first: 20) { nodes { id title taxable sku price compareAtPrice } }
+            variants(first: 20) {
+              nodes { id title taxable sku price compareAtPrice inventoryQuantity inventoryItem { id } }
+            }
           }
         }
       }`,
@@ -349,132 +414,54 @@ server.tool(
 );
 
 server.tool(
-  "update_product_type",
-  "Update a Shopify product type. Use only after the store owner confirms the change.",
-  { productId: z.string(), productType: z.string().min(1) },
-  async ({ productId, productType }) => {
-    const data = await shopifyGraphql(
-      `mutation ProductUpdate($input: ProductInput!) {
-        productUpdate(input: $input) {
-          product { id title productType }
-          userErrors { field message }
-        }
-      }`,
-      { input: { id: productId, productType } }
-    );
-    return { content: [{ type: "text", text: JSON.stringify(data.productUpdate, null, 2) }] };
-  }
-);
-
-server.tool(
-  "update_product_tags",
-  "Replace Shopify product tags. Use only after the store owner confirms the change.",
-  { productId: z.string(), tags: z.array(z.string()).default([]) },
-  async ({ productId, tags }) => {
-    const data = await shopifyGraphql(
-      `mutation ProductUpdate($input: ProductInput!) {
-        productUpdate(input: $input) {
-          product { id title tags }
-          userErrors { field message }
-        }
-      }`,
-      { input: { id: productId, tags } }
-    );
-    return { content: [{ type: "text", text: JSON.stringify(data.productUpdate, null, 2) }] };
-  }
-);
-
-server.tool(
-  "set_variant_taxable",
-  "Set taxable true/false on a product variant. Use only after the store owner confirms the change.",
-  { variantId: z.string(), taxable: z.boolean() },
-  async ({ variantId, taxable }) => {
-    const data = await shopifyGraphql(
-      `mutation ProductVariantUpdate($input: ProductVariantInput!) {
-        productVariantUpdate(input: $input) {
-          productVariant { id title taxable }
-          userErrors { field message }
-        }
-      }`,
-      { input: { id: variantId, taxable } }
-    );
-    return { content: [{ type: "text", text: JSON.stringify(data.productVariantUpdate, null, 2) }] };
-  }
-);
-
-server.tool(
-  "search_product_categories",
-  "Search Shopify product taxonomy categories by keyword.",
-  { query: z.string().min(1) },
-  async ({ query }) => {
-    const data = await shopifyGraphql(
-      `query SearchCategories($query: String!) {
-        taxonomy {
-          categories(first: 20, query: $query) {
-            nodes { id name fullName isLeaf }
-          }
-        }
-      }`,
-      { query }
-    );
-    return { content: [{ type: "text", text: JSON.stringify(data.taxonomy.categories.nodes, null, 2) }] };
-  }
-);
-
-server.tool(
-  "update_product_category",
-  "Update a Shopify product taxonomy category. Use only after the store owner confirms the change.",
-  {
-    productId: z.string().describe("gid://shopify/Product/123"),
-    categoryId: z.string().describe("gid://shopify/TaxonomyCategory/...")
-  },
-  async ({ productId, categoryId }) => {
-    const data = await shopifyGraphql(
-      `mutation UpdateProductCategory($product: ProductUpdateInput!) {
-        productUpdate(product: $product) {
-          product { id title category { id name fullName } }
-          userErrors { field message }
-        }
-      }`,
-      { product: { id: productId, category: categoryId } }
-    );
-    return { content: [{ type: "text", text: JSON.stringify(data.productUpdate, null, 2) }] };
-  }
-);
-
-// New tools
-
-server.tool(
   "get_product_by_handle",
-  "Fetch a single Shopify product by its handle or search by title. Use before create_product to avoid duplicates.",
+  "Fetch a single product by handle or search by title. Use before create_product to avoid duplicates.",
   {
     handle: z.string().optional().describe("Product handle, e.g. 'protein-isolate'"),
-    title: z.string().optional().describe("Product title to search for (partial match)")
+    title: z.string().optional().describe("Product title (partial match)")
   },
   async ({ handle, title }) => {
     if (!handle && !title) throw new Error("Provide at least handle or title.");
-
-    const query = handle
-      ? `query { products(first: 5, query: "handle:${handle}") { nodes { id title handle status vendor productType tags variants(first: 10) { nodes { id sku price compareAtPrice taxable } } } } }`
-      : `query { products(first: 10, query: "title:${title}") { nodes { id title handle status vendor productType tags variants(first: 10) { nodes { id sku price compareAtPrice taxable } } } } }`;
-
-    const data = await shopifyGraphql(query);
+    const q = handle ? `handle:${handle}` : `title:${title}`;
+    const data = await shopifyGraphql(
+      `query SearchProducts($q: String!) {
+        products(first: 10, query: $q) {
+          nodes {
+            id title handle status vendor productType tags
+            variants(first: 10) { nodes { id sku price compareAtPrice taxable inventoryQuantity inventoryItem { id } } }
+          }
+        }
+      }`,
+      { q }
+    );
     return { content: [{ type: "text", text: JSON.stringify(data.products.nodes, null, 2) }] };
   }
 );
 
 server.tool(
+  "get_locations",
+  "List Shopify fulfillment locations. Required to know the locationId before setting inventory.",
+  {},
+  async () => {
+    const data = await shopifyGraphql(
+      `query { locations(first: 20, includeInactive: false) { nodes { id name address { city } isPrimary } } }`
+    );
+    return { content: [{ type: "text", text: JSON.stringify(data.locations.nodes, null, 2) }] };
+  }
+);
+
+server.tool(
   "create_product",
-  "Create a new Shopify product. Use get_product_by_handle first to confirm it doesn't already exist. Use only after the store owner confirms.",
+  "Create a new Shopify product. Use get_product_by_handle first to confirm it doesn't exist. Use only after store owner confirms.",
   {
     title: z.string().min(1),
-    handle: z.string().optional().describe("URL-friendly handle, e.g. 'protein-isolate'. Shopify auto-generates if omitted."),
-    bodyHtml: z.string().optional().describe("Product description in HTML"),
+    handle: z.string().optional(),
+    bodyHtml: z.string().optional(),
     vendor: z.string().optional(),
     productType: z.string().optional(),
     tags: z.array(z.string()).optional(),
     status: z.enum(["ACTIVE", "DRAFT"]).default("DRAFT"),
-    categoryId: z.string().optional().describe("Shopify taxonomy category ID, e.g. gid://shopify/TaxonomyCategory/..."),
+    categoryId: z.string().optional().describe("gid://shopify/TaxonomyCategory/..."),
     imageSrc: z.string().optional().describe("URL of the product image"),
     variants: z.array(z.object({
       price: z.string(),
@@ -496,9 +483,7 @@ server.tool(
       ...(imageSrc && { images: [{ src: imageSrc }] }),
       ...(variants?.length && {
         variants: variants.map(v => ({
-          price: v.price,
-          taxable: v.taxable,
-          requiresShipping: v.requiresShipping,
+          price: v.price, taxable: v.taxable, requiresShipping: v.requiresShipping,
           ...(v.sku && { sku: v.sku }),
           ...(v.compareAtPrice && { compareAtPrice: v.compareAtPrice })
         }))
@@ -520,7 +505,7 @@ server.tool(
 
 server.tool(
   "update_product_details",
-  "Update title, description, vendor, or productType on a product. Use only after the store owner confirms.",
+  "Update title, description, vendor, productType, or tags on a product. Use only after store owner confirms.",
   {
     productId: z.string().describe("gid://shopify/Product/123"),
     title: z.string().optional(),
@@ -538,7 +523,6 @@ server.tool(
       ...(productType !== undefined && { productType }),
       ...(tags !== undefined && { tags })
     };
-
     const data = await shopifyGraphql(
       `mutation ProductUpdate($input: ProductInput!) {
         productUpdate(input: $input) {
@@ -553,36 +537,44 @@ server.tool(
 );
 
 server.tool(
-  "update_variant_price",
-  "Update price and/or compareAtPrice on a product variant. Use only after the store owner confirms.",
-  {
-    variantId: z.string().describe("gid://shopify/ProductVariant/123"),
-    price: z.string().optional(),
-    compareAtPrice: z.string().optional()
-  },
-  async ({ variantId, price, compareAtPrice }) => {
-    const input = {
-      id: variantId,
-      ...(price !== undefined && { price }),
-      ...(compareAtPrice !== undefined && { compareAtPrice })
-    };
-
+  "update_product_type",
+  "Update a Shopify product type. Use only after store owner confirms.",
+  { productId: z.string(), productType: z.string().min(1) },
+  async ({ productId, productType }) => {
     const data = await shopifyGraphql(
-      `mutation ProductVariantUpdate($input: ProductVariantInput!) {
-        productVariantUpdate(input: $input) {
-          productVariant { id title price compareAtPrice }
+      `mutation ProductUpdate($input: ProductInput!) {
+        productUpdate(input: $input) {
+          product { id title productType }
           userErrors { field message }
         }
       }`,
-      { input }
+      { input: { id: productId, productType } }
     );
-    return { content: [{ type: "text", text: JSON.stringify(data.productVariantUpdate, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify(data.productUpdate, null, 2) }] };
+  }
+);
+
+server.tool(
+  "update_product_tags",
+  "Replace Shopify product tags. Use only after store owner confirms.",
+  { productId: z.string(), tags: z.array(z.string()).default([]) },
+  async ({ productId, tags }) => {
+    const data = await shopifyGraphql(
+      `mutation ProductUpdate($input: ProductInput!) {
+        productUpdate(input: $input) {
+          product { id title tags }
+          userErrors { field message }
+        }
+      }`,
+      { input: { id: productId, tags } }
+    );
+    return { content: [{ type: "text", text: JSON.stringify(data.productUpdate, null, 2) }] };
   }
 );
 
 server.tool(
   "update_product_status",
-  "Change a product status to ACTIVE, DRAFT, or ARCHIVED. Use only after the store owner confirms.",
+  "Change a product status to ACTIVE, DRAFT, or ARCHIVED. Use only after store owner confirms.",
   {
     productId: z.string().describe("gid://shopify/Product/123"),
     status: z.enum(["ACTIVE", "DRAFT", "ARCHIVED"])
@@ -603,7 +595,7 @@ server.tool(
 
 server.tool(
   "archive_product",
-  "Archive a Shopify product (sets status to ARCHIVED). Never deletes. Use only after the store owner confirms.",
+  "Archive a product (sets status ARCHIVED). Never deletes. Use only after store owner confirms.",
   { productId: z.string().describe("gid://shopify/Product/123") },
   async ({ productId }) => {
     const data = await shopifyGraphql(
@@ -620,23 +612,121 @@ server.tool(
 );
 
 server.tool(
+  "update_variant_price",
+  "Update price and/or compareAtPrice on a product variant. Uses productVariantsBulkUpdate. Use only after store owner confirms.",
+  {
+    variantId: z.string().describe("gid://shopify/ProductVariant/123"),
+    price: z.string().optional(),
+    compareAtPrice: z.string().optional()
+  },
+  async ({ variantId, price, compareAtPrice }) => {
+    const productId = await getProductIdFromVariant(variantId);
+    const variant = {
+      id: variantId,
+      ...(price !== undefined && { price }),
+      ...(compareAtPrice !== undefined && { compareAtPrice })
+    };
+    const result = await variantsBulkUpdate(productId, [variant]);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "set_variant_taxable",
+  "Set taxable true/false on a product variant. Uses productVariantsBulkUpdate. Use only after store owner confirms.",
+  { variantId: z.string(), taxable: z.boolean() },
+  async ({ variantId, taxable }) => {
+    const productId = await getProductIdFromVariant(variantId);
+    const result = await variantsBulkUpdate(productId, [{ id: variantId, taxable }]);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "set_inventory",
+  "Set available stock quantity for a variant at a location. Use get_locations to find locationId. Use only after store owner confirms.",
+  {
+    inventoryItemId: z.string().describe("gid://shopify/InventoryItem/... — get it from list_products or get_product_by_handle"),
+    locationId: z.string().describe("gid://shopify/Location/... — get it from get_locations"),
+    quantity: z.number().int().min(0)
+  },
+  async ({ inventoryItemId, locationId, quantity }) => {
+    const data = await shopifyGraphql(
+      `mutation SetInventory($input: InventorySetQuantitiesInput!) {
+        inventorySetQuantities(input: $input) {
+          inventoryAdjustmentGroup { id reason }
+          userErrors { field message }
+        }
+      }`,
+      {
+        input: {
+          name: "available",
+          reason: "correction",
+          quantities: [{ inventoryItemId, locationId, quantity }]
+        }
+      }
+    );
+    return { content: [{ type: "text", text: JSON.stringify(data.inventorySetQuantities, null, 2) }] };
+  }
+);
+
+server.tool(
+  "search_product_categories",
+  "Search Shopify taxonomy categories by keyword. Returns IDs to use with update_product_category or create_product.",
+  { query: z.string().min(1) },
+  async ({ query }) => {
+    const data = await shopifyGraphql(
+      `query SearchCategories($query: String!) {
+        taxonomy {
+          categories(first: 20, query: $query) {
+            nodes { id name fullName isLeaf }
+          }
+        }
+      }`,
+      { query }
+    );
+    return { content: [{ type: "text", text: JSON.stringify(data.taxonomy.categories.nodes, null, 2) }] };
+  }
+);
+
+server.tool(
+  "update_product_category",
+  "Update a Shopify product taxonomy category. Use only after store owner confirms.",
+  {
+    productId: z.string().describe("gid://shopify/Product/123"),
+    categoryId: z.string().describe("gid://shopify/TaxonomyCategory/...")
+  },
+  async ({ productId, categoryId }) => {
+    const data = await shopifyGraphql(
+      `mutation UpdateProductCategory($product: ProductUpdateInput!) {
+        productUpdate(product: $product) {
+          product { id title category { id name fullName } }
+          userErrors { field message }
+        }
+      }`,
+      { product: { id: productId, category: categoryId } }
+    );
+    return { content: [{ type: "text", text: JSON.stringify(data.productUpdate, null, 2) }] };
+  }
+);
+
+server.tool(
   "sync_products_from_excel",
   [
     "Compare a Shopify products export (CSV text or base64 Excel) against the live Shopify catalog.",
-    "With dryRun:true returns a full plan: products to create, update, archive, and all field/price changes — without touching anything.",
-    "With dryRun:false applies creates and updates. Products in Shopify but absent from the file are flagged as potentialArchives but never auto-archived.",
-    "Products are matched by Handle first, then by Title. Always run dryRun:true first and confirm with the store owner before running dryRun:false."
+    "dryRun:true returns a full plan — products to create, update, set inventory — without changing anything.",
+    "dryRun:false applies all changes. Products absent from the file are flagged as potentialArchives but never auto-archived.",
+    "Products are matched by Handle first, then Title. Always confirm with store owner before dryRun:false."
   ].join(" "),
   {
-    fileContent: z.string().describe("Full CSV text (paste the Shopify products export) or base64-encoded Excel file"),
+    fileContent: z.string().describe("Full CSV text from Shopify products export, or base64-encoded Excel file"),
     fileType: z.enum(["csv", "excel"]).default("csv"),
     dryRun: z.boolean().default(true)
   },
   async ({ fileContent, fileType, dryRun }) => {
     const rows = parseFileContent(fileContent, fileType);
-    if (!rows.length) throw new Error("No rows found in file. Make sure to paste the full CSV including the header row.");
-
-    if (!("Handle" in rows[0])) throw new Error(`Missing 'Handle' column. Found columns: ${Object.keys(rows[0]).join(", ")}`);
+    if (!rows.length) throw new Error("No rows found. Make sure to include the header row.");
+    if (!("Handle" in rows[0])) throw new Error(`Missing 'Handle' column. Found: ${Object.keys(rows[0]).join(", ")}`);
 
     const fileProducts = groupRowsByHandle(rows);
     const shopifyProducts = await getAllShopifyProducts();
@@ -652,16 +742,10 @@ server.tool(
           potentialArchives: diff.potentialArchives.length
         },
         toCreate: diff.toCreate.map(({ fileProduct: fp }) => ({
-          handle: fp.handle,
-          title: fp.title,
-          status: fp.status,
-          variants: fp.variants.length
+          handle: fp.handle, title: fp.title, status: fp.status, variants: fp.variants.length
         })),
-        toUpdate: diff.toUpdate.map(({ shopifyProduct: sp, changes, variantChanges }) => ({
-          handle: sp.handle,
-          title: sp.title,
-          productChanges: changes,
-          variantChanges
+        toUpdate: diff.toUpdate.map(({ shopifyProduct: sp, changes, variantChanges, inventoryChanges }) => ({
+          handle: sp.handle, title: sp.title, productChanges: changes, variantChanges, inventoryChanges
         })),
         potentialArchives: diff.potentialArchives,
         unchanged: diff.unchanged.map(u => u.handle)
@@ -675,7 +759,8 @@ server.tool(
       applied: {
         created: log.filter(l => l.action === "create" && l.status === "success").length,
         updated: log.filter(l => l.action === "update" && l.status === "success").length,
-        variantsUpdated: log.filter(l => l.action === "updateVariant" && l.status === "success").length,
+        variantBatchesUpdated: log.filter(l => l.action === "updateVariants" && l.status === "success").length,
+        inventoryUpdated: log.filter(l => l.action === "setInventory" && l.status === "success").length,
         errors: log.filter(l => l.status === "error").length
       },
       potentialArchives: diff.potentialArchives,
@@ -698,7 +783,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.0.0", mcpEndpoint: "/mcp" });
+  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.2.0", mcpEndpoint: "/mcp" });
 });
 
 app.post("/mcp", assertAuthorized, async (req, res) => {
@@ -715,5 +800,5 @@ app.post("/mcp", assertAuthorized, async (req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`VitaFlow Shopify MCP v2.1.0 listening on port ${PORT}`);
+  console.log(`VitaFlow Shopify MCP v2.2.0 listening on port ${PORT}`);
 });
