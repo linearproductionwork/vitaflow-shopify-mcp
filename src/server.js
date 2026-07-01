@@ -99,6 +99,55 @@ async function variantsBulkUpdate(productId, variants) {
   return data.productVariantsBulkUpdate;
 }
 
+// Activates inventory item at location if needed, then sets absolute quantity
+async function activateAndSetInventory(inventoryItemId, locationId, quantity) {
+  // Check if already activated at this location
+  const check = await shopifyGraphql(
+    `query CheckInventoryLevel($id: ID!) {
+      inventoryItem(id: $id) {
+        inventoryLevels(first: 50) {
+          nodes { location { id } }
+        }
+      }
+    }`,
+    { id: inventoryItemId }
+  );
+
+  const activated = check.inventoryItem.inventoryLevels.nodes.some(
+    l => l.location.id === locationId
+  );
+
+  if (!activated) {
+    await shopifyGraphql(
+      `mutation ActivateInventory($itemId: ID!, $updates: [InventoryBulkToggleActivationInput!]!) {
+        inventoryBulkToggleActivation(inventoryItemId: $itemId, inventoryItemUpdates: $updates) {
+          inventoryItem { id }
+          userErrors { field message }
+        }
+      }`,
+      { itemId: inventoryItemId, updates: [{ locationId, activate: true }] }
+    );
+  }
+
+  const data = await shopifyGraphql(
+    `mutation SetInventory($input: InventorySetQuantitiesInput!) {
+      inventorySetQuantities(input: $input) {
+        inventoryAdjustmentGroup { id reason }
+        userErrors { field message }
+      }
+    }`,
+    {
+      input: {
+        name: "available",
+        reason: "correction",
+        quantities: [{ inventoryItemId, locationId, quantity }]
+      }
+    }
+  );
+
+  return data.inventorySetQuantities;
+}
+
 async function getAllShopifyProducts() {
   const all = [];
   let hasNextPage = true;
@@ -359,26 +408,13 @@ async function applyDiff(diff) {
       }
     }
 
-    if (inventoryChanges.length) {
+    for (const ic of inventoryChanges) {
       try {
-        const quantities = inventoryChanges.map(ic => ({
-          inventoryItemId: ic.inventoryItemId,
-          locationId,
-          quantity: ic.to
-        }));
-        const data = await shopifyGraphql(
-          `mutation SetInventory($input: InventorySetQuantitiesInput!) {
-            inventorySetQuantities(input: $input) {
-              inventoryAdjustmentGroup { id }
-              userErrors { field message }
-            }
-          }`,
-          { input: { name: "available", reason: "correction", quantities } }
-        );
-        const errs = data.inventorySetQuantities.userErrors;
-        log.push({ action: "setInventory", productTitle: sp.title, status: errs.length ? "error" : "success", changes: inventoryChanges.map(ic => ({ sku: ic.sku, from: ic.from, to: ic.to })), ...(errs.length ? { errors: errs } : {}) });
+        const result = await activateAndSetInventory(ic.inventoryItemId, locationId, ic.to);
+        const errs = result.userErrors;
+        log.push({ action: "setInventory", productTitle: sp.title, sku: ic.sku, from: ic.from, to: ic.to, status: errs.length ? "error" : "success", ...(errs.length ? { errors: errs } : {}) });
       } catch (e) {
-        log.push({ action: "setInventory", productTitle: sp.title, status: "error", error: e.message });
+        log.push({ action: "setInventory", productTitle: sp.title, sku: ic.sku, status: "error", error: e.message });
       }
     }
   }
@@ -388,7 +424,7 @@ async function applyDiff(diff) {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
-const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.2.0" });
+const server = new McpServer({ name: "vitaflow-shopify-mcp", version: "2.3.0" });
 
 server.tool(
   "list_products",
@@ -644,29 +680,15 @@ server.tool(
 
 server.tool(
   "set_inventory",
-  "Set available stock quantity for a variant at a location. Use get_locations to find locationId. Use only after store owner confirms.",
+  "Set available stock quantity for a variant at a location. Activates the inventory item at the location automatically if needed. Use get_locations to find locationId, and list_products to find inventoryItem.id. Use only after store owner confirms.",
   {
     inventoryItemId: z.string().describe("gid://shopify/InventoryItem/... — get it from list_products or get_product_by_handle"),
     locationId: z.string().describe("gid://shopify/Location/... — get it from get_locations"),
     quantity: z.number().int().min(0)
   },
   async ({ inventoryItemId, locationId, quantity }) => {
-    const data = await shopifyGraphql(
-      `mutation SetInventory($input: InventorySetQuantitiesInput!) {
-        inventorySetQuantities(input: $input) {
-          inventoryAdjustmentGroup { id reason }
-          userErrors { field message }
-        }
-      }`,
-      {
-        input: {
-          name: "available",
-          reason: "correction",
-          quantities: [{ inventoryItemId, locationId, quantity }]
-        }
-      }
-    );
-    return { content: [{ type: "text", text: JSON.stringify(data.inventorySetQuantities, null, 2) }] };
+    const result = await activateAndSetInventory(inventoryItemId, locationId, quantity);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
@@ -783,7 +805,7 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.2.0", mcpEndpoint: "/mcp" });
+  res.json({ ok: true, name: "vitaflow-shopify-mcp", version: "2.3.0", mcpEndpoint: "/mcp" });
 });
 
 app.post("/mcp", assertAuthorized, async (req, res) => {
@@ -800,5 +822,5 @@ app.post("/mcp", assertAuthorized, async (req, res) => {
 });
 
 app.listen(Number(PORT), () => {
-  console.log(`VitaFlow Shopify MCP v2.2.0 listening on port ${PORT}`);
+  console.log(`VitaFlow Shopify MCP v2.3.0 listening on port ${PORT}`);
 });
